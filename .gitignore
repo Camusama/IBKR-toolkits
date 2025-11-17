@@ -152,6 +152,10 @@ config/local_*.py
 .secrets/
 temp/
 tmp/
+data/
+
+# Desktop shortcuts
+*.lnk
 
 # UV
 .uv_cache/

@@ -38,10 +38,38 @@ def setup_logger(
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # 控制台处理器
-    console_handler = logging.StreamHandler(sys.stdout)
+    # 控制台处理器 - 处理 Windows 编码问题
+    try:
+        # 在 Windows 上尝试使用正确的编码
+        if sys.platform == 'win32':
+            # 尝试设置控制台编码为 UTF-8
+            try:
+                sys.stdout.reconfigure(encoding='utf-8')
+            except (AttributeError, OSError):
+                # 如果不支持 reconfigure，使用系统编码
+                pass
+        console_handler = logging.StreamHandler(sys.stdout)
+    except Exception:
+        # 如果设置失败，使用默认处理器
+        console_handler = logging.StreamHandler()
+
     console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
+
+    # 创建自定义格式化器来处理 Unicode 字符
+    class UnicodeSafeFormatter(logging.Formatter):
+        def format(self, record):
+            try:
+                return super().format(record)
+            except UnicodeEncodeError:
+                # 如果编码失败，替换非 ASCII 字符
+                record.msg = str(record.msg).encode('ascii', 'replace').decode('ascii')
+                return super().format(record)
+
+    unicode_formatter = UnicodeSafeFormatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_handler.setFormatter(unicode_formatter)
     logger.addHandler(console_handler)
     
     # 文件处理器
