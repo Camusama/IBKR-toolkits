@@ -421,6 +421,20 @@ Total Return %: {summary.account_total_return_percent:.2f}%"""
                     if stock.symbol == symbol:
                         underlying_price = stock.market_price
                         break
+
+                # If no exact match, try symbol mappings (for convenience)
+                if underlying_price is None:
+                    symbol_mappings = {
+                        'GOOG': 'GOOGL',
+                        'GOOGL': 'GOOG',  # Mutual mapping for convenience
+                    }
+
+                    mapped_symbol = symbol_mappings.get(symbol)
+                    if mapped_symbol:
+                        for stock in stocks:
+                            if stock.symbol == mapped_symbol:
+                                underlying_price = stock.market_price
+                                break
             
             if len(opts) > 1:
                 # Smart pairing

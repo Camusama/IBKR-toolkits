@@ -236,12 +236,26 @@ def fetch_greeks(client, options, option_contracts, stocks, wait_seconds=15, log
             option_groups[key].append(opt)
         
         for (symbol, expiry, right), opts in option_groups.items():
-            # Get underlying price
+            # Get underlying price - handle symbol mapping issues (GOOGL vs GOOG)
             underlying_price = None
             for stock in stocks:
                 if stock.symbol == symbol:
                     underlying_price = stock.market_price
                     break
+
+            # If no exact match, try symbol mappings (for convenience)
+            if not underlying_price:
+                symbol_mappings = {
+                    'GOOG': 'GOOGL',
+                    'GOOGL': 'GOOG',  # Mutual mapping for convenience
+                }
+
+                mapped_symbol = symbol_mappings.get(symbol)
+                if mapped_symbol:
+                    for stock in stocks:
+                        if stock.symbol == mapped_symbol:
+                            underlying_price = stock.market_price
+                            break
             
             if not underlying_price:
                 continue

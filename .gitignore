@@ -6,7 +6,7 @@ data
 logs
 # C extensions
 *.so
-
+.claude
 # Distribution / packaging
 .Python
 build/
