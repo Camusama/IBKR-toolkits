@@ -1,0 +1,16 @@
+{
+  "position": {
+    "short_call_strike": 292.5,
+    "short_put_strike": 265.0,
+    "long_call_strike": 305.0,
+    "long_put_strike": 250.0,
+    "expiry": "20251219",
+    "contracts": 1,
+    "initial_credit": 70.0,
+    "current_value": 70.0,
+    "entry_price": 278.23,
+    "entry_date": "2025-12-11"
+  },
+  "last_updated": "2025-12-11T00:30:15.999739",
+  "symbol": "AAPL"
+}
