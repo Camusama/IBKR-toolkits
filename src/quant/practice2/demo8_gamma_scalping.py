@@ -557,8 +557,12 @@ async def run_gamma_scalping(ib: IB):
 
             rebalanced = await rebalance_if_needed(ib, stock, option, state)
 
-            if not rebalanced:
+            if rebalanced:
+                # 再平衡时 print_status 已在 rebalance_if_needed 中调用
+                pass
+            else:
                 logger.info("Delta 在阈值范围内，无需再平衡")
+                print_status(state, f"第 {check_count} 次检查")
 
             # 检查止损
             if check_stop_loss(state):
