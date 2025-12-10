@@ -18,4 +18,3 @@ __all__ = [
     "PortfolioService",
     "ExportService",
 ]
-

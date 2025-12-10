@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "ib-async>=2.0.1",
- "python-dotenv>=1.0.0",
- "notion-client>=2.0.0",
- "pathspec>=0.12.1",
+    "python-dotenv>=1.0.0",
+    "notion-client>=2.0.0",
+    "pathspec>=0.12.1",
+    "pandas>=2.3.3",
+    "yfinance>=0.2.66",
 ]
 
 [project.optional-dependencies]
