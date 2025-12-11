@@ -1,0 +1,15 @@
+{
+  "position": {
+    "symbol": "AAPL",
+    "strike_call": 275.0,
+    "strike_put": 275.0,
+    "expiry": "20260116",
+    "contracts": 1,
+    "entry_iv": 0.20230322605708834,
+    "entry_price": 0.0,
+    "current_value": 1425.0,
+    "entry_date": ""
+  },
+  "last_updated": "2025-12-12T00:26:54.477596",
+  "symbol": "AAPL"
+}

@@ -631,6 +631,14 @@ async def run_strategy_check(ib: IB, continuous: bool = False):
             
             entry_iv = state.position.entry_iv
             
+            # 修复：如果从 IBKR 加载的仓位没有 Entry IV (为0)，则重置为当前 IV
+            # 避免 entry_iv=0 导致 exit 逻辑 (current > 0*1.2) 误触发
+            if entry_iv == 0.0 and state.current_iv > 0:
+                logger.warning(f"⚠️ 缺失 Entry IV，重置为当前 IV: {state.current_iv:.1%} 以继续监控")
+                state.position.entry_iv = state.current_iv
+                entry_iv = state.current_iv
+                save_position(state.position)
+            
             # 止损
             if pnl_pct < -STOP_LOSS_PCT:
                 action = "CLOSE"
@@ -660,14 +668,14 @@ async def run_strategy_check(ib: IB, continuous: bool = False):
                 action = "OPEN_SHORT"
                 reason = f"IV {state.current_iv:.1%} > {IV_HIGH_THRESHOLD:.1%} (偏高)"
                 new_pos = await open_straddle(ib, stock, "short", state.current_price)
-                if SIMULATION_MODE:
+                if new_pos:
                     save_position(new_pos)
                     
             elif state.current_iv < IV_LOW_THRESHOLD:
                 action = "OPEN_LONG"
                 reason = f"IV {state.current_iv:.1%} < {IV_LOW_THRESHOLD:.1%} (偏低)"
                 new_pos = await open_straddle(ib, stock, "long", state.current_price)
-                if SIMULATION_MODE:
+                if new_pos:
                     save_position(new_pos)
 
         # 5. 报告

@@ -461,7 +461,10 @@ async def run_strategy(ib: IB, continuous: bool = False):
             # Here we just open if no position for practice
             action = "OPEN"
             reason = "无持仓，建立日历价差"
-            await open_calendar_spread(ib, stock, state.current_price)
+            new_pos = await open_calendar_spread(ib, stock, state.current_price)
+            if new_pos:
+                state.position = new_pos
+                save_position(new_pos)
             
         print_status(state, action, reason)
         
