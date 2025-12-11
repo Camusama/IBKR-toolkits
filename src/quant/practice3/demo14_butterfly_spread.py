@@ -35,69 +35,24 @@ BF_STOP_LOSS=0.80      # 亏损达 80% 时止损
   - 盈亏平衡：$266 + 净成本 ~ $294 - 净成本
 
 ================================================================================
-📌 与 Iron Condor 的区别
+📌 运行方式
 ================================================================================
-┌─────────────┬───────────────────────────────────────┐
-│   策略      │         特点                          │
-├─────────────┼───────────────────────────────────────┤
-│ Butterfly   │ 精准押注某一价位，风险更低，收益也低   │
-│ Iron Condor │ 押注价格区间，收益和风险都更高         │
-└─────────────┴───────────────────────────────────────┘
+# 模式1: 单次检查（推荐用於 cron）
+BF_MODE=daily uv run demo14_butterfly_spread.py
 
-================================================================================
-📌 使用场景
-================================================================================
-✅ 适合：
-   - 强烈预期股价横盘不动
-   - 财报前后波动率预期很低
-   - 想要极低成本入场试探
-   - 预判价格会收敛到某一点位
-
-❌ 不适合：
-   - 预期大涨大跌
-   - 高波动率环境
-   - 流动性差的标的（难以构建4腿）
-
-================================================================================
-📌 运行方式（推荐：每天检查 1 次）
-================================================================================
-# 方式1: 每天开盘后运行
-uv run demo14_butterfly_spread.py
-
-# 方式2: cron 定时任务（美东时间 9:35 检查）
-# 35 9 * * 1-5 cd /path/to/project && uv run demo14_butterfly_spread.py
-
-# 首次运行：自动建立 Butterfly 仓位
-# 后续运行：监控价格，达到止盈/止损条件自动平仓
-
-================================================================================
-📌 盈亏分析
-================================================================================
-假设：净成本 $50（买入 - 卖出）
-
-最大盈利：翼展宽度×100 - 净成本 = ($280-$266)×100 - $50 = $1350（到期正好$280）
-最大亏损：$50（净成本，股价远离中点）
-盈亏比：约 27:1 （盈利空间大，但概率低）
-
-建议：小仓位尝试，明确预期价位
-
-================================================================================
-📌 风险提示
-================================================================================
-⚠️ 股价偏离中点越远，盈利越少
-⚠️ 时间价值对 Butterfly 不利（需要价格配合）
-⚠️ 构建4腿交易，手续费较高
-⚠️ 流动性差时难以平仓
+# 模式2: 持续监控
+BF_MODE=continuous uv run demo14_butterfly_spread.py
 
 ================================================================================
 """
 import asyncio
 import os
 import math
+import json
 import logging
 from datetime import datetime
-from typing import Optional, Tuple
-from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple
+from dataclasses import dataclass, field, asdict
 
 from ib_async import IB, Stock, Option, MarketOrder
 
@@ -122,28 +77,36 @@ STOP_LOSS_PCT = float(os.getenv("BF_STOP_LOSS", "0.80"))  # 亏损80%平仓
 
 CHECK_INTERVAL_SEC = int(os.getenv("BF_CHECK_INTERVAL", "60"))
 FALLBACK_PRICE = float(os.getenv("BF_FALLBACK_PRICE", "280"))
+RUN_MODE = os.getenv("BF_MODE", "daily")
 
 USE_DELAYED_DATA = os.getenv("BF_USE_DELAYED", "true").lower() == "true"
-SIMULATION_MODE = os.getenv("BF_SIMULATION", "true").lower() == "true"
+SIMULATION_MODE = os.getenv("BF_SIMULATION", "false").lower() == "true"  # Default false for live
 
-shutdown_requested = False
+# 状态文件
+STATE_DIR = os.path.join(os.path.dirname(__file__), ".states")
+STATE_FILE = os.path.join(STATE_DIR, f"butterfly_{SYMBOL.lower()}.json")
 
 
 @dataclass
 class ButterflyPosition:
     """Butterfly Spread 仓位"""
-    # 行权价
+    symbol: str
     lower_strike: float = 0.0   # 下翼（买入）
     middle_strike: float = 0.0  # 身体（卖出×2）
     upper_strike: float = 0.0   # 上翼（买入）
-
     expiry: str = ""
     contracts: int = 0
     option_type: str = "C"  # Call Butterfly
-
-    # 成本
     initial_cost: float = 0.0   # 初始净成本
     current_value: float = 0.0  # 当前持仓价值
+    entry_date: str = ""
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'ButterflyPosition':
+        return cls(**data)
 
     def get_max_profit(self) -> float:
         """最大盈利 = 翼展 × 100 - 初始成本（股价恰好在中点到期）"""
@@ -154,46 +117,52 @@ class ButterflyPosition:
         """最大亏损 = 初始成本（股价远离中点）"""
         return self.initial_cost
 
-    def get_profit_point(self) -> float:
-        """最大盈利点"""
-        return self.middle_strike
-
 
 @dataclass
 class StrategyState:
-    position: ButterflyPosition = field(default_factory=ButterflyPosition)
-    start_time: Optional[datetime] = None
+    position: Optional[ButterflyPosition] = None
     current_price: float = 0.0
-    initial_price: float = 0.0
 
-    # 期权合约
-    lower_option: Optional[Option] = None
-    middle_option: Optional[Option] = None
-    upper_option: Optional[Option] = None
 
-    def get_pnl(self) -> float:
-        """当前盈亏 = 当前价值 - 初始成本"""
-        return self.position.current_value - self.position.initial_cost
+def load_local_position() -> Optional[ButterflyPosition]:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, 'r') as f:
+            data = json.load(f)
+            return ButterflyPosition.from_dict(data['position'])
+    except Exception as e:
+        logger.error(f"加载仓位失败: {e}")
+        return None
 
-    def get_pnl_pct(self) -> float:
-        """盈亏比例"""
-        if self.position.initial_cost == 0:
-            return 0.0
-        # Butterfly 是净支出策略，盈利是正的
-        return self.get_pnl() / self.position.initial_cost
+
+def save_position(position: ButterflyPosition):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    data = {
+        'position': position.to_dict(),
+        'last_updated': datetime.now().isoformat(),
+        'symbol': SYMBOL
+    }
+    with open(STATE_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+    logger.info(f"仓位已保存: {STATE_FILE}")
+
+
+def clear_position():
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+        logger.info("仓位已清除")
 
 
 async def connect_ib() -> IB:
-    """连接到 Interactive Brokers"""
     ib = IB()
     await ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
-    # 设置市场数据类型：3=延迟数据，1=实时数据
     ib.reqMarketDataType(3 if USE_DELAYED_DATA else 1)
     return ib
 
 
 async def get_stock_price(ib: IB, stock: Stock) -> float:
-    """获取股票价格"""
     ticker = ib.reqMktData(stock, "", False, False)
     await asyncio.sleep(2)
     price = ticker.last or ticker.close or FALLBACK_PRICE
@@ -205,261 +174,401 @@ async def get_option_price(ib: IB, option: Option) -> float:
     """获取期权价格"""
     ticker = ib.reqMktData(option, "", False, False)
     await asyncio.sleep(2)
-    price = ticker.last or ticker.close or (
-        (ticker.bid or 0) + (ticker.ask or 0)) / 2
+    price = ticker.last or ticker.close or ((ticker.bid or 0) + (ticker.ask or 0)) / 2
     ib.cancelMktData(option)
     return price if price and not math.isnan(price) else 0.0
 
 
-async def find_option(ib: IB, stock: Stock, right: str, strike: float, expiry: str) -> Optional[Option]:
-    """获取指定期权合约"""
-    option = Option(stock.symbol, expiry, strike, right, "SMART")
-    try:
-        qualified = await ib.qualifyContractsAsync(option)
-        if qualified and qualified[0]:
-            return qualified[0]
-    except Exception as e:
-        logger.error(f"获取期权失败: {e}")
+async def cancel_all_option_orders(ib: IB, symbol: str):
+    open_trades = ib.openTrades()
+    count = 0
+    for trade in open_trades:
+        c = trade.contract
+        if c.secType == "OPT" and c.symbol == symbol:
+            if trade.orderStatus.status in ["PendingSubmit", "PreSubmitted", "Submitted"]:
+                ib.cancelOrder(trade.order)
+                count += 1
+    if count:
+        await asyncio.sleep(2)
+        logger.info(f"✅ 已取消 {count} 个挂单")
+
+
+async def load_position_from_ibkr(ib: IB, symbol: str) -> Optional[ButterflyPosition]:
+    """从 IBKR 识别 Butterfly 持仓"""
+    positions = ib.positions()
+    opts = [p for p in positions if p.contract.symbol == symbol and p.contract.secType == "OPT"]
+    
+    if not opts:
+        return None
+    
+    # 按照 Expiry 分组
+    from collections import defaultdict
+    by_expiry = defaultdict(list)
+    for p in opts:
+        by_expiry[p.contract.lastTradeDateOrContractMonth].append(p)
+        
+    for expiry, group in by_expiry.items():
+        # 需要至少3个腿
+        if len(group) < 3:
+            continue
+            
+        calls = [p for p in group if p.contract.right == 'C']
+        
+        # 简化识别：Long Call (Low) + Short Call (Mid) + Long Call (High)
+        # Quantity ratio: 1 : -2 : 1
+        # Sort by strike
+        calls.sort(key=lambda p: p.contract.strike)
+        
+        if len(calls) >= 3:
+            # 滑动窗口检测
+            for i in range(len(calls) - 2):
+                low_leg = calls[i]
+                mid_leg = calls[i+1]
+                high_leg = calls[i+2]
+                
+                # 检查 Strike 等距
+                if not math.isclose(mid_leg.contract.strike - low_leg.contract.strike, 
+                                    high_leg.contract.strike - mid_leg.contract.strike, abs_tol=0.1):
+                    continue
+                    
+                # 检查方向和比例
+                # 典型蝶式: 1 Long, -2 Short, 1 Long
+                qty_low = low_leg.position
+                qty_mid = mid_leg.position
+                qty_high = high_leg.position
+                
+                # 检查是否为标准比例 1:-2:1
+                if qty_low > 0 and qty_high > 0 and qty_mid < 0:
+                    ratio_ok = (qty_low == abs(qty_mid)/2) and (qty_high == abs(qty_mid)/2)
+                    # 或者简单持仓检查
+                    if ratio_ok:
+                        logger.info(f"✅ 检测到 Butterfly: {expiry} Call {low_leg.contract.strike}/{mid_leg.contract.strike}/{high_leg.contract.strike}")
+                        
+                        local = load_local_position()
+                        cost = local.initial_cost if local else 0.0
+                        date = local.entry_date if local else ""
+                        
+                        return ButterflyPosition(
+                            symbol=symbol,
+                            lower_strike=low_leg.contract.strike,
+                            middle_strike=mid_leg.contract.strike,
+                            upper_strike=high_leg.contract.strike,
+                            expiry=expiry,
+                            contracts=int(qty_low),
+                            initial_cost=cost,
+                            entry_date=date
+                        )
     return None
 
 
-async def get_option_chain_info(ib: IB, stock: Stock) -> Tuple[list, list]:
-    """获取期权链信息（到期日和行权价列表）"""
+async def open_butterfly(ib: IB, stock: Stock, price: float) -> Optional[ButterflyPosition]:
+    """建立 Butterfly Spread 仓位"""
+    logger.info("📦 正在开仓 Butterfly...")
+    
     chains = await ib.reqSecDefOptParamsAsync(stock.symbol, "", stock.secType, stock.conId)
     if not chains:
-        return [], []
-
-    # 优先选择 SMART 交易所
+        logger.error("无法获取期权链")
+        return None
+        
     chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+    
+    # 获取有效到期日
+    import datetime as dt
+    target_date = (datetime.now() + dt.timedelta(days=14)).strftime("%Y%m%d") # 2周后
+    valid_exps = sorted([e for e in chain.expirations if e > target_date])
+    if not valid_exps:
+        valid_exps = sorted([e for e in chain.expirations if e > datetime.now().strftime("%Y%m%d")])
+        
+    if not valid_exps:
+        logger.error("无可用到期日")
+        return None
+        
+    expiry = valid_exps[0]
+    
+    # 获取 Contract Details 以确保 Strike 存在
+    temp = Option(stock.symbol, expiry, exchange="SMART")
+    try:
+        details = await ib.reqContractDetailsAsync(temp)
+    except Exception as e:
+        logger.error(f"无法获取合约详情: {e}")
+        return None
+        
+    if not details:
+        return None
+        
+    # 只看 Call
+    valid_calls = sorted([d.contract for d in details if d.contract.right == 'C'], key=lambda c: c.strike)
+    if not valid_calls:
+        return None
+        
+    # 找 ATM Strike 作为 Body
+    mid_idx = -1
+    min_diff = float('inf')
+    for i, c in enumerate(valid_calls):
+        diff = abs(c.strike - price)
+        if diff < min_diff:
+            min_diff = diff
+            mid_idx = i
+            
+    if mid_idx == -1:
+        return None
+        
+    # 寻找 Wings
+    # WING_PCT e.g. 0.05 => Strike +/- 5%
+    wing_dist_req = price * WING_PCT
+    
+    # 向上/下搜寻最接近 wing_dist 的 strike
+    mid_strike = valid_calls[mid_idx].strike
+    
+    low_idx = -1
+    min_dist_low = float('inf')
+    
+    high_idx = -1
+    min_dist_high = float('inf')
+    
+    # 向下找 Lower Inner Wing (Standard Butterfly uses equidistant wings)
+    # 实际上我们只要找两个 equidistant 的点即可.
+    # 简单起见，遍历所有组合
+    # 但为了效率，我们从 mid 向两边找
+    
+    # 更好的方法：确定 Lower, 则 Upper = Mid + (Mid - Lower)
+    # 遍历可能的 Lower
+    best_combo = None
+    min_cost_diff = float('inf') # 这里不是指价格成本，而是指“偏离理想Wing宽度的程度”
+    
+    for i in range(mid_idx - 1, -1, -1):
+        lower_c = valid_calls[i]
+        width = mid_strike - lower_c.strike
+        target_upper = mid_strike + width
+        
+        # 检查是否存在 Upper
+        upper_c = next((c for c in valid_calls if abs(c.strike - target_upper) < 0.01), None)
+        
+        if upper_c:
+            # 找到一个组合
+            # 检查宽度是否接近理想值
+            diff_metric = abs(width - wing_dist_req)
+            if diff_metric < min_cost_diff:
+                min_cost_diff = diff_metric
+                best_combo = (lower_c, valid_calls[mid_idx], upper_c)
+                
+    if not best_combo:
+         logger.error("无法找到合适的 Butterfly 组合 (等距Strike)")
+         return None
+         
+    low_opt, mid_opt, high_opt = best_combo
+    
+    # Qualify (already from details, usually qualified, but good to be safe for order)
+    # details contracts are usually fully defined but let's just use them
+    
+    # Get Prices
+    lp = await get_option_price(ib, low_opt)
+    mp = await get_option_price(ib, mid_opt)
+    hp = await get_option_price(ib, high_opt)
+    
+    net_cost = (lp - 2*mp + hp) * 100 * NUM_CONTRACTS
+    
+    if SIMULATION_MODE:
+        logger.info(f"[模拟] Butterfly: +1 {low_opt.strike}, -2 {mid_opt.strike}, +1 {high_opt.strike}, Cost: ${net_cost:.2f}")
+    else:
+        # Place orders
+        # Leg 1: Buy Low
+        # Leg 2: Sell 2 Mid
+        # Leg 3: Buy High
+        
+        o1 = MarketOrder("BUY", NUM_CONTRACTS)
+        o2 = MarketOrder("SELL", 2 * NUM_CONTRACTS)
+        o3 = MarketOrder("BUY", NUM_CONTRACTS)
+        
+        t1 = ib.placeOrder(low_opt, o1)
+        t2 = ib.placeOrder(mid_opt, o2)
+        t3 = ib.placeOrder(high_opt, o3)
+        
+        MAX_WAIT = 15
+        for _ in range(MAX_WAIT):
+            if t1.isDone() and t2.isDone() and t3.isDone():
+                break
+            await asyncio.sleep(1)
+            
+        logger.info("✅ 订单提交完成")
+        
+    return ButterflyPosition(
+        symbol=SYMBOL,
+        lower_strike=low_opt.strike,
+        middle_strike=mid_opt.strike,
+        upper_strike=high_opt.strike,
+        expiry=expiry,
+        contracts=NUM_CONTRACTS,
+        initial_cost=net_cost,
+        current_value=net_cost,
+        entry_date=datetime.now().strftime("%Y-%m-%d")
+    )
 
-    # 筛选未来的到期日
-    today = datetime.now().strftime("%Y%m%d")
-    valid_expiries = sorted([e for e in chain.expirations if e > today])
-    strikes = sorted(chain.strikes)
 
-    return valid_expiries, strikes
+async def close_butterfly(ib: IB, position: ButterflyPosition, reason: str):
+    logger.info(f"🔄 平仓 Butterfly ({reason})...")
+    
+    if SIMULATION_MODE:
+        logger.info("[模拟] 平仓完成")
+        clear_position()
+        return
+        
+    # Reconstruct contracts
+    low_opt = Option(position.symbol, position.expiry, position.lower_strike, "C", "SMART")
+    mid_opt = Option(position.symbol, position.expiry, position.middle_strike, "C", "SMART")
+    high_opt = Option(position.symbol, position.expiry, position.upper_strike, "C", "SMART")
+    
+    await ib.qualifyContractsAsync(low_opt)
+    await ib.qualifyContractsAsync(mid_opt)
+    await ib.qualifyContractsAsync(high_opt)
+    
+    # Reverse ops
+    o1 = MarketOrder("SELL", position.contracts)
+    o2 = MarketOrder("BUY", 2 * position.contracts)
+    o3 = MarketOrder("SELL", position.contracts)
+    
+    t1 = ib.placeOrder(low_opt, o1)
+    t2 = ib.placeOrder(mid_opt, o2)
+    t3 = ib.placeOrder(high_opt, o3)
+    
+    MAX_WAIT = 15
+    for _ in range(MAX_WAIT):
+        if t1.isDone() and t2.isDone() and t3.isDone():
+            break
+        await asyncio.sleep(1)
+        
+    logger.info("✅ 平仓完成")
+    clear_position()
 
 
-def print_status(state: StrategyState, reason: str = ""):
-    """打印策略状态"""
+async def close_all_positions(ib: IB):
+    print("\n🔥 一键平仓模式")
+    await cancel_all_option_orders(ib, SYMBOL)
+    pos = await load_position_from_ibkr(ib, SYMBOL)
+    if pos:
+        await close_butterfly(ib, pos, "一键平仓指令")
+    else:
+        print("📭 未检测到持仓")
+        clear_position()
+
+
+def print_status(state: StrategyState, action: str, reason: str):
     pos = state.position
     print("\n" + "=" * 60)
-    print(f"🦋 Butterfly Spread 状态 {'(' + reason + ')' if reason else ''}")
+    print(f"🦋 Butterfly Spread 状态 - {SYMBOL}")
+    print(f"⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
-
-    elapsed = (datetime.now() -
-               state.start_time).total_seconds() if state.start_time else 0
-    print(f"⏰ 运行: {int(elapsed/60)} 分钟 | 📈 股价: ${state.current_price:.2f}")
-
-    # 图形化显示结构
-    print("-" * 60)
-    print("【Butterfly 结构】")
-    print(f"  买1张 ${pos.lower_strike:.0f} Call ← 卖2张 ${pos.middle_strike:.0f} Call → 买1张 ${pos.upper_strike:.0f} Call")
-    print(f"  └── 下翼 ──┘      └── 身体 ──┘      └── 上翼 ──┘")
-    print(f"  最大盈利点: ${pos.middle_strike:.2f}")
-
-    # 价格位置可视化
-    range_width = pos.upper_strike - pos.lower_strike
-    if range_width > 0:
-        price_pos = (state.current_price - pos.lower_strike) / range_width
-        bar_len = 40
-        price_idx = int(price_pos * bar_len)
-        price_idx = max(0, min(bar_len, price_idx))
-        middle_idx = int(0.5 * bar_len)  # 中点
-
-        bar = ["─"] * bar_len
-        bar[middle_idx] = "◆"  # 最大盈利点
-        if 0 <= price_idx < bar_len:
-            bar[price_idx] = "●"  # 当前价格
-        print(f"  [{(''.join(bar))}]")
-        print(
-            f"  ● = 当前价格 ${state.current_price:.0f}  ◆ = 最大盈利点 ${pos.middle_strike:.0f}")
-
-    # 位置状态
-    distance_pct = abs(state.current_price -
-                       pos.middle_strike) / pos.middle_strike * 100
-    if distance_pct < 1:
-        print(f"  ✅ 接近最大盈利点！距离 {distance_pct:.1f}%")
-    elif distance_pct < 3:
-        print(f"  🟡 距离最大盈利点 {distance_pct:.1f}%")
-    else:
-        print(f"  ⚠️ 偏离最大盈利点 {distance_pct:.1f}%")
-
-    print("-" * 60)
-    print("【盈亏】")
-    print(f"  初始成本: ${pos.initial_cost:.2f}")
-    print(f"  当前价值: ${pos.current_value:.2f}")
-    pnl = state.get_pnl()
-    pnl_pct = state.get_pnl_pct()
-    print(f"  当前盈亏: ${pnl:+.2f} ({pnl_pct:+.1%})")
-    print(f"  最大盈利: ${pos.get_max_profit():.2f}（股价=${pos.middle_strike:.0f}时）")
-    print(f"  最大亏损: ${pos.get_max_loss():.2f}（成本）")
+    print(f"股价: ${state.current_price:.2f}")
+    
+    if pos:
+        print(f"\n【持仓结构】")
+        print(f"  Long ${pos.lower_strike} C | Short 2x ${pos.middle_strike} C | Long ${pos.upper_strike} C")
+        print(f"  到期: {pos.expiry}")
+        
+        pnl = pos.current_value - pos.initial_cost
+        pnl_pct = pnl / pos.initial_cost if pos.initial_cost else 0
+        
+        print(f"  初始成本: ${pos.initial_cost:.2f}")
+        print(f"  当前价值: ${pos.current_value:.2f}")
+        print(f"  当前盈亏: ${pnl:+.2f} ({pnl_pct:+.1%})")
+        
+        max_profit = pos.get_max_profit()
+        print(f"  最大盈利: ${max_profit:.2f} (若到期价=${pos.middle_strike})")
+        
+    print(f"\n【决策】")
+    print(f"  👉 动作: {action}")
+    print(f"  📝 原因: {reason}")
     print("=" * 60)
 
 
-async def build_butterfly(ib: IB, stock: Stock, state: StrategyState):
-    """建立 Butterfly Spread 仓位"""
-    price = await get_stock_price(ib, stock)
-    state.current_price = price
-    state.initial_price = price
-
-    # 获取期权链
-    expiries, strikes = await get_option_chain_info(ib, stock)
-    if not expiries or not strikes:
-        raise RuntimeError("无法获取期权链")
-
-    # 选择到期日（2-4周后）
-    expiry = expiries[1] if len(expiries) > 1 else expiries[0]
-
-    # 计算行权价：下翼、中点（ATM）、上翼
-    middle_strike = min(strikes, key=lambda x: abs(x - price))
-    lower_strike = min(strikes, key=lambda x: abs(
-        x - price * (1 - WING_PCT)) if x < middle_strike else float('inf'))
-    upper_strike = min(strikes, key=lambda x: abs(
-        x - price * (1 + WING_PCT)) if x > middle_strike else float('inf'))
-
-    logger.info(f"构建 Butterfly @ {expiry}")
-    logger.info(
-        f"  买 ${lower_strike} Call | 卖×2 ${middle_strike} Call | 买 ${upper_strike} Call")
-
-    # 获取期权合约
-    state.lower_option = await find_option(ib, stock, "C", lower_strike, expiry)
-    state.middle_option = await find_option(ib, stock, "C", middle_strike, expiry)
-    state.upper_option = await find_option(ib, stock, "C", upper_strike, expiry)
-
-    if not all([state.lower_option, state.middle_option, state.upper_option]):
-        raise RuntimeError("无法获取所有期权腿")
-
-    # 获取价格并计算净成本
-    lower_price = await get_option_price(ib, state.lower_option)
-    middle_price = await get_option_price(ib, state.middle_option)
-    upper_price = await get_option_price(ib, state.upper_option)
-
-    # 净成本 = 买入价 - 卖出价（卖2张中间）
-    # Butterfly: +1 lower, -2 middle, +1 upper
-    net_cost = (lower_price - 2 * middle_price +
-                upper_price) * 100 * NUM_CONTRACTS
-
-    if SIMULATION_MODE:
-        logger.info(f"[模拟] 建立 Butterfly, 净成本: ${net_cost:.2f}")
-        logger.info(f"  下翼: ${lower_price:.2f} × 1 = ${lower_price * 100:.2f}")
-        logger.info(
-            f"  身体: ${middle_price:.2f} × 2 = ${middle_price * 200:.2f}（卖出）")
-        logger.info(f"  上翼: ${upper_price:.2f} × 1 = ${upper_price * 100:.2f}")
-
-    # 更新状态
-    state.position.lower_strike = lower_strike
-    state.position.middle_strike = middle_strike
-    state.position.upper_strike = upper_strike
-    state.position.expiry = expiry
-    state.position.contracts = NUM_CONTRACTS
-    state.position.initial_cost = net_cost
-    state.position.current_value = net_cost
-
-
-async def update_position_value(ib: IB, state: StrategyState):
-    """更新持仓价值"""
-    if not all([state.lower_option, state.middle_option, state.upper_option]):
-        return
-
-    lower_price = await get_option_price(ib, state.lower_option)
-    middle_price = await get_option_price(ib, state.middle_option)
-    upper_price = await get_option_price(ib, state.upper_option)
-
-    # 当前价值 = 平仓可获得的金额
-    current_value = (lower_price - 2 * middle_price +
-                     upper_price) * 100 * NUM_CONTRACTS
-    state.position.current_value = current_value
-
-
-async def close_butterfly(ib: IB, state: StrategyState):
-    """平仓 Butterfly"""
-    logger.info("🔄 平仓 Butterfly...")
-    await update_position_value(ib, state)
-
-    final_pnl = state.get_pnl()
-    if SIMULATION_MODE:
-        logger.info(f"[模拟] 平仓, 最终盈亏: ${final_pnl:+.2f}")
-
-    state.position.contracts = 0
-
-
-async def run_butterfly(ib: IB):
-    """主策略循环"""
-    global shutdown_requested
-
-    logger.info("🦋 启动 Butterfly Spread 策略")
-    logger.info(f"标的: {SYMBOL} | 合约: {NUM_CONTRACTS}")
-    logger.info(f"翼展: ±{WING_PCT:.1%}")
-    logger.info("💡 按 Ctrl+C 退出")
-
+async def run_strategy(ib: IB, continuous: bool = False):
+    logger.info(f"启动 Butterfly 策略 (Continuous={continuous})")
+    
     stock = Stock(SYMBOL, EXCHANGE, CURRENCY)
     stock = (await ib.qualifyContractsAsync(stock))[0]
-
+    
     state = StrategyState()
-    state.start_time = datetime.now()
-
-    # 建仓
-    await build_butterfly(ib, stock, state)
-    print_status(state, "建仓")
-
-    check_count = 0
-    exit_reason = "手动退出"
-
-    try:
-        while not shutdown_requested:
-            await asyncio.sleep(CHECK_INTERVAL_SEC)
-            check_count += 1
-
-            state.current_price = await get_stock_price(ib, stock)
-            await update_position_value(ib, state)
-
-            pnl_pct = state.get_pnl_pct()
-            logger.info(
-                f"--- 检查 #{check_count} | 股价: ${state.current_price:.2f} | P&L: {pnl_pct:+.1%} ---")
-
-            # 检查止盈
+    
+    while True:
+        state.current_price = await get_stock_price(ib, stock)
+        
+        state.position = await load_position_from_ibkr(ib, SYMBOL)
+        if not state.position and SIMULATION_MODE:
+            state.position = load_local_position()
+            
+        action = "HOLD"
+        reason = "观察中"
+        
+        if state.position:
+            # Update Value
+            l = Option(SYMBOL, state.position.expiry, state.position.lower_strike, "C", "SMART")
+            m = Option(SYMBOL, state.position.expiry, state.position.middle_strike, "C", "SMART")
+            h = Option(SYMBOL, state.position.expiry, state.position.upper_strike, "C", "SMART")
+            
+            await ib.qualifyContractsAsync(l)
+            await ib.qualifyContractsAsync(m)
+            await ib.qualifyContractsAsync(h)
+            
+            lp = await get_option_price(ib, l)
+            mp = await get_option_price(ib, m)
+            hp = await get_option_price(ib, h)
+            
+            curr_val = (lp - 2*mp + hp) * 100 * state.position.contracts
+            state.position.current_value = curr_val
+            
+            pnl = curr_val - state.position.initial_cost
+            cost = state.position.initial_cost
+            pnl_pct = pnl / cost if cost > 0 else 0
+            
             if pnl_pct >= PROFIT_TARGET_PCT:
-                logger.info(f"✅ 达到盈利目标 {pnl_pct:.1%}")
-                exit_reason = f"止盈 ({pnl_pct:.1%})"
-                break
-
-            # 检查止损
-            if pnl_pct <= -STOP_LOSS_PCT:
-                logger.info(f"🛑 触发止损 {pnl_pct:.1%}")
-                exit_reason = f"止损 ({pnl_pct:.1%})"
-                break
-
-    except KeyboardInterrupt:
-        exit_reason = "用户中断"
-
-    logger.info(f"📤 退出: {exit_reason}")
-    await close_butterfly(ib, state)
-    print_status(state, "结束")
-
-
-def handle_shutdown(signum, frame):
-    """处理关闭信号"""
-    global shutdown_requested
-    shutdown_requested = True
+                action = "CLOSE"
+                reason = f"止盈 ({pnl_pct:.1%})"
+            elif pnl_pct <= -STOP_LOSS_PCT: # Butterfly is debit strategy, max loss is 100% of cost usually
+                action = "CLOSE"
+                reason = f"止损 ({pnl_pct:.1%})"
+                
+            if action == "CLOSE":
+                await close_butterfly(ib, state.position, reason)
+                state.position = None
+                
+        else:
+            action = "OPEN"
+            reason = "无持仓，建立 Butterfly"
+            new_pos = await open_butterfly(ib, stock, state.current_price)
+            if new_pos:
+                state.position = new_pos
+                save_position(new_pos)
+            else:
+                action = "WAIT"
+                reason = "开仓失败 (未找到合适合约)"
+                
+        print_status(state, action, reason)
+        
+        if not continuous:
+            break
+            
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 
 async def main():
     import signal
+    def handle_shutdown(signum, frame):
+        pass
     signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
+    
     ib = await connect_ib()
     try:
-        await run_butterfly(ib)
+        if RUN_MODE == "close_all":
+            await close_all_positions(ib)
+        elif RUN_MODE == "continuous":
+            await run_strategy(ib, continuous=True)
+        else:
+            await run_strategy(ib, continuous=False)
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
     finally:
         ib.disconnect()
 
 
 if __name__ == "__main__":
-    print("""
-🦋 Butterfly Spread 策略 - 精准押注价格回归
-   预期股价在某一价位附近到期，低成本高回报
-   按 Ctrl+C 退出
-""")
     asyncio.run(main())

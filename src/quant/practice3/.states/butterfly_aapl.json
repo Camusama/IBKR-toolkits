@@ -1,0 +1,16 @@
+{
+  "position": {
+    "symbol": "AAPL",
+    "lower_strike": 260.0,
+    "middle_strike": 275.0,
+    "upper_strike": 290.0,
+    "expiry": "20260102",
+    "contracts": 1,
+    "option_type": "C",
+    "initial_cost": 622.0,
+    "current_value": 622.0,
+    "entry_date": "2025-12-12"
+  },
+  "last_updated": "2025-12-12T00:31:45.566582",
+  "symbol": "AAPL"
+}
