@@ -799,12 +799,53 @@ async def run_daily_check(ib: IB):
 
     current_price = await get_stock_price(ib, stock)
 
-    # 优先从 IBKR 查询真实持仓
-    position = await load_position_from_ibkr(ib, SYMBOL)
+    # 修复：优先从本地状态文件识别仓位（避免多策略共用期权导致识别错误）
+    # 1. 先加载本地保存的仓位
+    local_position = load_position()
     
-    # 如果 IBKR 没有持仓，再检查本地文件（可能是模拟模式的记录）
-    if position is None and SIMULATION_MODE:
-        position = load_position()
+    if local_position:
+        # 2. 验证 IBKR 中是否仍持有对应合约的4条腿
+        positions = ib.positions()
+        opts = [p for p in positions if p.contract.symbol == SYMBOL and p.contract.secType == "OPT"]
+        
+        # 检查本地记录的四个腿是否在 IBKR 中存在
+        has_short_call = any(
+            p.contract.strike == local_position.short_call_strike and 
+            p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+            p.contract.right == "C" and p.position < 0
+            for p in opts
+        )
+        has_long_call = any(
+            p.contract.strike == local_position.long_call_strike and 
+            p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+            p.contract.right == "C" and p.position > 0
+            for p in opts
+        )
+        has_short_put = any(
+            p.contract.strike == local_position.short_put_strike and 
+            p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+            p.contract.right == "P" and p.position < 0
+            for p in opts
+        )
+        has_long_put = any(
+            p.contract.strike == local_position.long_put_strike and 
+            p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+            p.contract.right == "P" and p.position > 0
+            for p in opts
+        )
+        
+        if has_short_call and has_long_call and has_short_put and has_long_put:
+            logger.info(f"✅ 从本地状态确认 Iron Condor 仓位:")
+            logger.info(f"   买Put ${local_position.long_put_strike} | 卖Put ${local_position.short_put_strike} | 卖Call ${local_position.short_call_strike} | 买Call ${local_position.long_call_strike}")
+            logger.info(f"   到期日: {local_position.expiry}, 合约数: {local_position.contracts}")
+            position = local_position
+        else:
+            logger.warning(f"⚠️ 本地记录的 Iron Condor 在 IBKR 中部分或全部不存在 (SC={has_short_call}, LC={has_long_call}, SP={has_short_put}, LP={has_long_put})，清除本地记录")
+            clear_position()
+            position = None
+    else:
+        # 3. 没有本地记录，尝试从 IBKR 自动检测
+        position = await load_position_from_ibkr(ib, SYMBOL)
 
     if position is None:
         # 无仓位，建立新仓

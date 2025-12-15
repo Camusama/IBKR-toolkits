@@ -1,15 +1,15 @@
 {
   "position": {
     "symbol": "AAPL",
-    "strike_call": 292.5,
-    "strike_put": 265.0,
-    "expiry": "20251219",
-    "contracts": -1,
-    "entry_iv": 0.20230322605708834,
-    "entry_price": 0.38,
-    "current_value": 38.0,
+    "strike_call": 275.0,
+    "strike_put": 275.0,
+    "expiry": "20260116",
+    "contracts": 1,
+    "entry_iv": 0.19995978098871436,
+    "entry_price": 12.9,
+    "current_value": 1290.0,
     "entry_date": "2025-12-16"
   },
-  "last_updated": "2025-12-16T01:14:54.991441",
+  "last_updated": "2025-12-16T01:35:18.939439",
   "symbol": "AAPL"
 }

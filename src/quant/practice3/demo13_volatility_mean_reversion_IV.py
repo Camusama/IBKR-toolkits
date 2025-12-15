@@ -270,9 +270,9 @@ async def load_position_from_ibkr(ib: IB, symbol: str) -> Optional[VolatilityPos
             call_pos = calls[0]
             put_pos = puts[0]
             
-            # 检查数量是否匹配 (符号相同表示同向)
-            if call_pos.position == put_pos.position:
-                logger.info(f"✅ 检测到组合持仓: {expiry} Call:{call_pos.contract.strike} Put:{put_pos.contract.strike}")
+            # 检查数量是否匹配 (符号相同表示同向) 且行权价相同（真正的 Straddle）
+            if call_pos.position == put_pos.position and call_pos.contract.strike == put_pos.contract.strike:
+                logger.info(f"✅ 检测到 Straddle 持仓: {expiry} Strike:{call_pos.contract.strike}")
                 
                 # 读取本地保存的 entry_iv，如果没找到则用当前 IV 估算或设为 0
                 local_pos = load_local_position()
@@ -584,11 +584,52 @@ async def run_strategy_check(ib: IB, continuous: bool = False):
         # 1. 基础数据更新
         state.current_price = await get_stock_price(ib, stock)
         
-        # 2. 获取持仓 (优先从 IBKR 加载)
-        state.position = await load_position_from_ibkr(ib, SYMBOL)
-        if not state.position and SIMULATION_MODE:
-             # 模拟模式下如果没有真实持仓，尝试加载本地模拟持仓
-             state.position = load_local_position()
+        # 2. 修复：优先从本地状态文件识别仓位
+        # Straddle 必须是同一行权价的 Call+Put
+        local_position = load_local_position()
+        
+        if local_position:
+            # 验证是否是真正的 Straddle（同行权价）
+            is_straddle = local_position.strike_call == local_position.strike_put
+            
+            if is_straddle:
+                # 验证 IBKR 中是否仍持有对应合约
+                positions = ib.positions()
+                opts = [p for p in positions if p.contract.symbol == SYMBOL and p.contract.secType == "OPT"]
+                
+                # 检查本地记录的 Call 和 Put 是否在 IBKR 中存在（方向需匹配）
+                expected_sign = -1 if local_position.contracts < 0 else 1  # Short=-1, Long=1
+                
+                has_call = any(
+                    p.contract.strike == local_position.strike_call and 
+                    p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+                    p.contract.right == "C" and 
+                    (p.position > 0) == (expected_sign > 0)
+                    for p in opts
+                )
+                has_put = any(
+                    p.contract.strike == local_position.strike_put and 
+                    p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+                    p.contract.right == "P" and 
+                    (p.position > 0) == (expected_sign > 0)
+                    for p in opts
+                )
+                
+                if has_call and has_put:
+                    logger.info(f"✅ 从本地状态确认 Straddle 仓位: {local_position.strike_call} @ {local_position.expiry}")
+                    state.position = local_position
+                else:
+                    logger.warning(f"⚠️ 本地记录的 Straddle 在 IBKR 中不存在 (call={has_call}, put={has_put})，清除本地记录")
+                    clear_position()
+                    state.position = None
+            else:
+                # 本地记录不是真正的 Straddle（Call/Put 行权价不同），清除错误数据
+                logger.warning(f"⚠️ 本地记录的不是 Straddle（Call={local_position.strike_call} ≠ Put={local_position.strike_put}），清除错误记录")
+                clear_position()
+                state.position = None
+        else:
+            # 没有本地记录，尝试从 IBKR 自动检测（只检测真正的 Straddle：同行权价）
+            state.position = await load_position_from_ibkr(ib, SYMBOL)
         
         # 3. 获取 ATM IV
         # 为了获取 IV，如果是持仓状态，用持仓的 Option；否则找 ATM
