@@ -437,7 +437,13 @@ def print_daily_report(
         print(f"  ⚠️ 价格超出盈利区间！")
 
     print(f"\n【盈亏】")
-    print(f"  初始权利金: ${position.initial_credit:.2f}")
+    # 处理 initial_credit 为 0 的情况
+    credit_display = position.initial_credit
+    credit_note = ""
+    if position.initial_credit == 0 or abs(position.initial_credit) < 0.01:
+        credit_display = position.current_value
+        credit_note = " (⚠️ 估算值)"
+    print(f"  初始权利金: ${credit_display:.2f}{credit_note}")
     print(f"  当前价值: ${position.current_value:.2f}")
     print(f"  盈亏: ${pnl:+.2f} ({pnl_pct:+.1%})")
     print(f"  最大盈利: ${position.get_max_profit():.2f}")
@@ -865,8 +871,16 @@ async def run_daily_check(ib: IB):
         else:
             # ========== 持仓数量正好，检查并更新 ==========
             position.current_value = await update_position_value(ib, stock, position)
+            
+            # 修复：如果 initial_credit 为 0，使用当前价值作为成本基础并保存
+            if position.initial_credit == 0 or abs(position.initial_credit) < 0.01:
+                position.initial_credit = position.current_value
+                position.entry_date = position.entry_date or datetime.now().strftime("%Y-%m-%d")
+                logger.warning(f"⚠️ 缺失 initial_credit，使用当前市场价值 ${position.current_value:.2f} 作为成本基础")
+                save_position(position)
+            
             pnl = position.initial_credit - position.current_value
-            pnl_pct = pnl / position.initial_credit if position.initial_credit else 0
+            pnl_pct = pnl / position.initial_credit if position.initial_credit != 0 else 0
 
             # 决定调仓动作
             action, reason = decide_adjustment(position, current_price, pnl_pct)

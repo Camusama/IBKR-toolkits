@@ -1,0 +1,15 @@
+{
+  "position": {
+    "symbol": "AAPL",
+    "strike": 275.0,
+    "front_expiry": "20251226",
+    "back_expiry": "20260109",
+    "rights": "C",
+    "contracts": 1,
+    "initial_cost": 226.99999999999994,
+    "current_value": 226.99999999999994,
+    "entry_date": "2025-12-16"
+  },
+  "last_updated": "2025-12-16T01:16:03.000378",
+  "symbol": "AAPL"
+}

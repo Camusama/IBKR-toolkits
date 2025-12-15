@@ -536,16 +536,25 @@ def print_status_report(state: StrategyState, action: str, reason: str):
         print(f"  建仓 IV: {pos.entry_iv:.1%}")
         
         # 估算 PnL
-        pnl = pos.current_value - (pos.entry_price * abs(pos.contracts) * 100)
+        # 如果 entry_price 为 0，使用当前价值作为成本基础（表示成本信息缺失）
+        entry_price_display = pos.entry_price
+        cost_note = ""
+        if pos.entry_price == 0 or pos.entry_price < 0.01:
+            # 成本信息缺失，使用当前价值估算（假设刚刚开仓，无盈亏）
+            entry_price_display = pos.current_value / (abs(pos.contracts) * 100) if pos.contracts != 0 else 0
+            cost_note = " (⚠️ 估算值)"
+        
+        pnl = pos.current_value - (entry_price_display * abs(pos.contracts) * 100)
         # 如果是 Short，PnL = 卖出得钱 - 当前买回花费
         if pos.contracts < 0:
-            pnl = (pos.entry_price * abs(pos.contracts) * 100) - pos.current_value
+            pnl = (entry_price_display * abs(pos.contracts) * 100) - pos.current_value
             
         pnl_pct = 0.0
-        cost_basis = pos.entry_price * abs(pos.contracts) * 100
+        cost_basis = entry_price_display * abs(pos.contracts) * 100
         if cost_basis > 0:
             pnl_pct = pnl / cost_basis
             
+        print(f"  建仓成本: ${entry_price_display:.2f}/组合{cost_note}")
         print(f"  当前价值: ${pos.current_value:.2f}")
         print(f"  浮动盈亏: ${pnl:+.2f} ({pnl_pct:+.1%})")
     
@@ -596,6 +605,13 @@ async def run_strategy_check(ib: IB, continuous: bool = False):
             iv_sample = (civ + piv) / 2
             
             state.position.current_value = (cp + pp) * 100 * abs(state.position.contracts)
+            
+            # 修复：如果 entry_price 为 0，使用当前价格作为成本基础并保存
+            if state.position.entry_price == 0 or state.position.entry_price < 0.01:
+                state.position.entry_price = cp + pp  # 组合单价
+                state.position.entry_date = state.position.entry_date or datetime.now().strftime("%Y-%m-%d")
+                logger.warning(f"⚠️ 缺失 entry_price，使用当前市场价格 ${state.position.entry_price:.2f} 作为成本基础")
+                save_position(state.position)
         else:
             # 无持仓，找 ATM 估算当前 IV
             chains = await ib.reqSecDefOptParamsAsync(stock.symbol, "", stock.secType, stock.conId)
@@ -621,13 +637,20 @@ async def run_strategy_check(ib: IB, continuous: bool = False):
             days = state.position.get_days_to_expiry()
             
             # 计算 PnL Pct
-            cost = state.position.entry_price * abs(state.position.contracts) * 100
-            if state.position.contracts < 0: # Short
-                pnl = cost - state.position.current_value
-            else: # Long
-                pnl = state.position.current_value - cost
-            
-            pnl_pct = pnl / cost if cost > 0 else 0
+            # 确保 entry_price 有效
+            entry_price = state.position.entry_price
+            if entry_price == 0 or entry_price < 0.01:
+                # 没有成本信息，无法计算准确盈亏，跳过止盈止损逻辑
+                logger.warning("⚠️ 缺失成本信息，无法计算盈亏比例")
+                pnl = 0
+                pnl_pct = 0
+            else:
+                cost = entry_price * abs(state.position.contracts) * 100
+                if state.position.contracts < 0: # Short
+                    pnl = cost - state.position.current_value
+                else: # Long
+                    pnl = state.position.current_value - cost
+                pnl_pct = pnl / cost if cost > 0 else 0
             
             entry_iv = state.position.entry_iv
             

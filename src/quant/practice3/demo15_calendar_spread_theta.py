@@ -376,11 +376,19 @@ def print_status(state: StrategyState, action: str, reason: str):
         print(f"  行权价: ${pos.strike}")
         print(f"  近期(Short): {pos.front_expiry} ({pos.get_days_to_front_expiry()}天)")
         print(f"  远期(Long):  {pos.back_expiry}")
-        print(f"  初始成本: ${pos.initial_cost:.2f}")
+        
+        # 处理 initial_cost 为 0 的情况
+        cost_display = pos.initial_cost
+        cost_note = ""
+        if pos.initial_cost == 0 or abs(pos.initial_cost) < 0.01:
+            cost_display = pos.current_value
+            cost_note = " (⚠️ 估算值)"
+        
+        print(f"  初始成本: ${cost_display:.2f}{cost_note}")
         print(f"  当前价值: ${pos.current_value:.2f}")
         
-        pnl = pos.current_value - pos.initial_cost
-        pnl_pct = pnl / pos.initial_cost if pos.initial_cost > 0 else 0
+        pnl = pos.current_value - cost_display
+        pnl_pct = pnl / cost_display if cost_display != 0 else 0
         print(f"  盈亏: ${pnl:+.2f} ({pnl_pct:+.1%})")
         print(f"  净 Theta: {state.net_theta:+.2f} (Time Decay Income)")
         
@@ -401,9 +409,41 @@ async def run_strategy(ib: IB, continuous: bool = False):
     while True:
         state.current_price = await get_stock_price(ib, stock)
         
-        state.position = await load_position_from_ibkr(ib, SYMBOL)
-        if not state.position and SIMULATION_MODE:
-            state.position = load_local_position()
+        # 修复：优先使用本地状态文件识别仓位
+        # 1. 先加载本地保存的仓位
+        local_position = load_local_position()
+        
+        if local_position:
+            # 2. 验证 IBKR 中是否仍持有对应合约
+            positions = ib.positions()
+            opts = [p for p in positions if p.contract.symbol == SYMBOL and p.contract.secType == "OPT"]
+            
+            # 检查本地记录的两个腿是否在 IBKR 中存在
+            # Front leg: Short (negative position)
+            has_front = any(
+                p.contract.strike == local_position.strike and 
+                p.contract.lastTradeDateOrContractMonth == local_position.front_expiry and
+                p.contract.right == local_position.rights and p.position < 0
+                for p in opts
+            )
+            # Back leg: Long (positive position)
+            has_back = any(
+                p.contract.strike == local_position.strike and 
+                p.contract.lastTradeDateOrContractMonth == local_position.back_expiry and
+                p.contract.right == local_position.rights and p.position > 0
+                for p in opts
+            )
+            
+            if has_front and has_back:
+                logger.info(f"✅ 从本地状态确认 Calendar 仓位: {local_position.front_expiry}(S)/{local_position.back_expiry}(L) @ {local_position.strike}")
+                state.position = local_position
+            else:
+                logger.warning(f"⚠️ 本地记录的 Calendar 在 IBKR 中部分或全部不存在 (front={has_front}, back={has_back})，清除本地记录")
+                clear_position()
+                state.position = None
+        else:
+            # 3. 没有本地记录，尝试从 IBKR 自动检测
+            state.position = await load_position_from_ibkr(ib, SYMBOL)
             
         action = "HOLD"
         reason = "观察中"
@@ -436,8 +476,15 @@ async def run_strategy(ib: IB, continuous: bool = False):
             state.net_theta = (-ft) + bt
             state.position.current_value = (bp - fp) * 100 * state.position.contracts
             
+            # 修复：如果 initial_cost 为 0，使用当前价值作为成本基础并保存
+            if state.position.initial_cost == 0 or abs(state.position.initial_cost) < 0.01:
+                state.position.initial_cost = state.position.current_value
+                state.position.entry_date = state.position.entry_date or datetime.now().strftime("%Y-%m-%d")
+                logger.warning(f"⚠️ 缺失 initial_cost，使用当前市场价值 ${state.position.current_value:.2f} 作为成本基础")
+                save_position(state.position)
+            
             pnl = state.position.current_value - state.position.initial_cost
-            pnl_pct = pnl / state.position.initial_cost if state.position.initial_cost else 0
+            pnl_pct = pnl / state.position.initial_cost if state.position.initial_cost != 0 else 0
             
             days = state.position.get_days_to_front_expiry()
             

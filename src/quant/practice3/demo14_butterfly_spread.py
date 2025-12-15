@@ -465,10 +465,18 @@ def print_status(state: StrategyState, action: str, reason: str):
         print(f"  Long ${pos.lower_strike} C | Short 2x ${pos.middle_strike} C | Long ${pos.upper_strike} C")
         print(f"  到期: {pos.expiry}")
         
-        pnl = pos.current_value - pos.initial_cost
-        pnl_pct = pnl / pos.initial_cost if pos.initial_cost else 0
+        # 处理 initial_cost 为 0 的情况
+        cost_display = pos.initial_cost
+        cost_note = ""
+        if pos.initial_cost == 0 or abs(pos.initial_cost) < 0.01:
+            # 成本信息缺失，使用当前价值作为成本（假设刚开仓无盈亏）
+            cost_display = pos.current_value
+            cost_note = " (⚠️ 估算值)"
         
-        print(f"  初始成本: ${pos.initial_cost:.2f}")
+        pnl = pos.current_value - cost_display
+        pnl_pct = pnl / cost_display if cost_display != 0 else 0
+        
+        print(f"  初始成本: ${cost_display:.2f}{cost_note}")
         print(f"  当前价值: ${pos.current_value:.2f}")
         print(f"  当前盈亏: ${pnl:+.2f} ({pnl_pct:+.1%})")
         
@@ -492,9 +500,45 @@ async def run_strategy(ib: IB, continuous: bool = False):
     while True:
         state.current_price = await get_stock_price(ib, stock)
         
-        state.position = await load_position_from_ibkr(ib, SYMBOL)
-        if not state.position and SIMULATION_MODE:
-            state.position = load_local_position()
+        # 修复：优先使用本地状态文件识别仓位
+        # 1. 先加载本地保存的仓位
+        local_position = load_local_position()
+        
+        if local_position:
+            # 2. 验证 IBKR 中是否仍持有对应合约（至少有部分持仓）
+            positions = ib.positions()
+            opts = [p for p in positions if p.contract.symbol == SYMBOL and p.contract.secType == "OPT"]
+            
+            # 检查本地记录的三个腿是否在 IBKR 中存在
+            has_lower = any(
+                p.contract.strike == local_position.lower_strike and 
+                p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+                p.contract.right == "C" and p.position > 0
+                for p in opts
+            )
+            has_middle = any(
+                p.contract.strike == local_position.middle_strike and 
+                p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+                p.contract.right == "C" and p.position < 0
+                for p in opts
+            )
+            has_upper = any(
+                p.contract.strike == local_position.upper_strike and 
+                p.contract.lastTradeDateOrContractMonth == local_position.expiry and
+                p.contract.right == "C" and p.position > 0
+                for p in opts
+            )
+            
+            if has_lower and has_middle and has_upper:
+                logger.info(f"✅ 从本地状态确认 Butterfly 仓位: {local_position.lower_strike}/{local_position.middle_strike}/{local_position.upper_strike} @ {local_position.expiry}")
+                state.position = local_position
+            else:
+                logger.warning(f"⚠️ 本地记录的 Butterfly 在 IBKR 中部分或全部不存在 (lower={has_lower}, mid={has_middle}, upper={has_upper})，清除本地记录")
+                clear_position()
+                state.position = None
+        else:
+            # 3. 没有本地记录，尝试从 IBKR 自动检测
+            state.position = await load_position_from_ibkr(ib, SYMBOL)
             
         action = "HOLD"
         reason = "观察中"
@@ -516,9 +560,16 @@ async def run_strategy(ib: IB, continuous: bool = False):
             curr_val = (lp - 2*mp + hp) * 100 * state.position.contracts
             state.position.current_value = curr_val
             
+            # 修复：如果 initial_cost 为 0，使用当前价值作为成本基础并保存
+            if state.position.initial_cost == 0 or abs(state.position.initial_cost) < 0.01:
+                state.position.initial_cost = curr_val
+                state.position.entry_date = state.position.entry_date or datetime.now().strftime("%Y-%m-%d")
+                logger.warning(f"⚠️ 缺失 initial_cost，使用当前市场价值 ${curr_val:.2f} 作为成本基础")
+                save_position(state.position)
+            
             pnl = curr_val - state.position.initial_cost
             cost = state.position.initial_cost
-            pnl_pct = pnl / cost if cost > 0 else 0
+            pnl_pct = pnl / cost if cost != 0 else 0
             
             if pnl_pct >= PROFIT_TARGET_PCT:
                 action = "CLOSE"
